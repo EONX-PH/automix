@@ -714,6 +714,8 @@ async function startScan() {
   const threads = parseInt(document.getElementById('threadSlider').value) || 5;
 
   if (!cards)   { toast('Paste cards first.', 'warn'); return; }
+  const proxy = document.getElementById('proxyInput').value.trim();
+  if (!proxy)   { toast('Proxy is required.', 'err'); document.getElementById('proxyInput').focus(); return; }
   // Empty domains is allowed — backend falls back to saved authnet.txt / ppcp.txt
 
   // Spinner on START button
@@ -732,7 +734,6 @@ async function startScan() {
   setProgress(0, 1);
   setStatus('Starting…', 'badge-info');
 
-  const proxy = document.getElementById('proxyInput').value.trim();
   const clientToken = _getClientToken();
   const gateway = _gateway;
 
@@ -741,7 +742,7 @@ async function startScan() {
     res  = await fetch('/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cards, domains, threads, client_token: clientToken, gateway, ...(proxy ? { proxy } : {}) }),
+      body: JSON.stringify({ cards, domains, threads, client_token: clientToken, gateway, proxy }),
     });
     data = await res.json();
   } catch(e) {
