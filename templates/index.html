@@ -345,10 +345,6 @@
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.3rem;">
               <div style="display:flex;align-items:center;gap:.5rem;">
                 <span style="font-size:.78rem;color:#4caf50;font-weight:600;letter-spacing:.04em;">GOOD SITES</span>
-                <button id="btnLoadSites" onclick="loadSavedSites()" title="Load saved working sites for this gateway"
-                  style="background:none;border:1px solid rgba(76,175,80,.4);color:#4caf50;border-radius:4px;padding:1px 6px;font-size:.72rem;cursor:pointer;line-height:1.4;"
-                  >↻ Load Saved</button>
-                <span id="savedSiteCount" style="font-size:.72rem;color:#888;"></span>
               </div>
 
             </div>
@@ -540,42 +536,9 @@ function setGateway(gw) {
   const lbl = document.querySelector('#domainGroup label');
   if (lbl) lbl.textContent = _GW_DOMAIN_HINTS[gw] || _GW_DOMAIN_HINTS.authnet;
   try { sessionStorage.setItem('chkr_gateway', gw); } catch(e) {}
-  // Auto-load saved sites count badge, and populate textarea if empty
-  _updateSavedSiteCount(gw);
 }
 
-async function _updateSavedSiteCount(gw) {
-  try {
-    const r = await fetch('/sites/' + gw);
-    const sites = await r.json();
-    const el = document.getElementById('savedSiteCount');
-    if (el) el.textContent = sites.length ? '(' + sites.length + ' saved)' : '';
-    // Auto-populate textarea if currently empty
-    const ta = document.getElementById('domainInput');
-    if (ta && !ta.value.trim() && sites.length) {
-      ta.value = sites.join('\n');
-      const grp = document.getElementById('domainGroup');
-      if (grp) grp.classList.add('filled');
-    }
-  } catch(e) {}
-}
 
-async function loadSavedSites() {
-  try {
-    const r = await fetch('/sites/' + _gateway);
-    const sites = await r.json();
-    if (!sites.length) { toast('No saved sites for ' + _gateway.toUpperCase() + ' yet.', 'warn'); return; }
-    const ta = document.getElementById('domainInput');
-    if (ta) {
-      ta.value = sites.join('\n');
-      const grp = document.getElementById('domainGroup');
-      if (grp) grp.classList.add('filled');
-      toast('Loaded ' + sites.length + ' saved sites', 'ok');
-      const el = document.getElementById('savedSiteCount');
-      if (el) el.textContent = '(' + sites.length + ' saved)';
-    }
-  } catch(e) { toast('Failed to load sites', 'err'); }
-}
 
 // ─── Persistent session token (survives page refresh, unique per browser) ────
 function _getClientToken() {
@@ -843,8 +806,6 @@ async function startScan() {
             const grp = document.getElementById('domainGroup');
             if (grp) grp.classList.toggle('filled', ta.value.trim() !== '');
           }
-          // Refresh "(N saved)" badge — server already removed it from file
-          _updateSavedSiteCount(_gateway);
         }
         if (msg.status === 'live') {
           const binInfo = msg.bin_info ? ' <span style="color:#b0bec5;font-size:.75em">[' + esc(msg.bin_info) + ']</span>' : '';
