@@ -28,8 +28,7 @@ from gateways.b3woo      import check_b3woo
 from gateways.ppcp       import check_ppcp
 from gateways.pymntpl    import check_pymntpl
 from gateways.utils      import (
-    build_session,
-    build_session_for_domain,
+    build_plain_session,
     build_session_from_str,
     fetch_bin_dict,
     fetch_bin_info,
@@ -287,7 +286,7 @@ def _scan_worker(
                 if user_proxy:
                     sess = build_session_from_str(user_proxy)
                 else:
-                    sess = build_session_for_domain(domain)
+                    sess = build_plain_session()
                 try:
                     if gateway == "ppcp":
                         result = check_ppcp(sess, domain, card_tuple)
