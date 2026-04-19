@@ -290,7 +290,8 @@ def _discover_product(session: requests.Session, domain: str, ua: str):
 
     # Fallback: HTML scraping for Magento 2 product IDs
     product_ids: list = []
-    for path in ("/", "/catalogsearch/result/?q=a"):
+    for path in ("/", "/catalogsearch/result/?q=a", "/catalogsearch/result/?q=e",
+                 "/catalogsearch/result/?q=the", "/catalogsearch/result/?q=s"):
         try:
             r = session.get(f"https://{domain}{path}", headers={"User-Agent": ua}, timeout=REQUEST_TIMEOUT)
             html = r.text
@@ -576,7 +577,9 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, f
         with _PRODUCT_CACHE_LOCK:
             if product:
                 _PRODUCT_CACHE[domain] = product
-            _PRODUCT_DISCOVERY_EVENTS[domain].set()
+            # Always remove the event — on failure, next thread can retry
+            _PRODUCT_DISCOVERY_EVENTS.pop(domain, None)
+        evt.set()  # wake up any threads that were waiting
 
     if not product:
         return {"status": "unknown", "message": "Could not find product on store", "amount": "", "card": card_str}
