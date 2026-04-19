@@ -231,6 +231,8 @@
     #gwSelect.gw-ppcp      { border-color:rgba(0,150,220,.5);  box-shadow:0 0 6px rgba(0,150,220,.25); }
     #gwSelect.gw-pymntpl   { border-color:rgba(103,58,183,.5); box-shadow:0 0 6px rgba(103,58,183,.25); }
     #gwSelect.gw-b3magento { border-color:rgba(230,81,0,.5);   box-shadow:0 0 6px rgba(230,81,0,.25); }
+    #gwSelect.gw-b3magus    { border-color:rgba(230,100,0,.5);  box-shadow:0 0 6px rgba(230,100,0,.25); }
+    #gwSelect.gw-b3mageuk   { border-color:rgba(0,100,200,.5);  box-shadow:0 0 6px rgba(0,100,200,.25); }
     #gwSelect.gw-b3woo     { border-color:rgba(127,84,179,.5); box-shadow:0 0 6px rgba(127,84,179,.25); }
 
     /* ----- Panel icon buttons (copy + eye) — fixed square, all screens ----- */
@@ -319,6 +321,8 @@
               <option value="ppcp">PPCP</option>
               <option value="pymntpl">PYMNTPL</option>
               <option value="b3magento">B3 MAGENTO</option>
+              <option value="b3magus">B3 MAGUS (US)</option>
+              <option value="b3mageuk">B3 MAGEUK (UK)</option>
               <option value="b3woo">B3 WOO</option>
             </select>
           </div>
@@ -524,6 +528,8 @@ const _GW_DOMAIN_HINTS = {
   ppcp:      'PayPal / PPCP — enter target store URLs',
   pymntpl:   'PaymentPlugins — enter target store URLs',
   b3magento: 'Braintree Magento 2 — enter target store URLs',
+  b3magus:   'Braintree Magento 2 US — enter target store URLs',
+  b3mageuk:  'Braintree Magento 2 UK — enter target store URLs',
   b3woo:     'Braintree WooCommerce — enter target store URLs',
 };
 function setGateway(gw) {
@@ -615,7 +621,7 @@ function loadSession() {
       document.getElementById('threadVal').textContent = t;
     }
     if (p) document.getElementById('proxyInput').value = p;
-    if (gw && ['authnet','ppcp','pymntpl','b3magento','b3woo'].includes(gw)) setGateway(gw);
+    if (gw && ['authnet','ppcp','pymntpl','b3magento','b3magus','b3mageuk','b3woo'].includes(gw)) setGateway(gw);
     else setGateway('authnet');
     ['cardGroup','domainGroup'].forEach(id => {
       const grp = document.getElementById(id);

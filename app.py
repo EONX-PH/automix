@@ -24,6 +24,8 @@ from flask import Flask, Response, jsonify, render_template, request
 
 from gateways.authnetcim import check_authnet
 from gateways.b3magento  import check_b3magento
+from gateways.b3magus    import check_b3magus
+from gateways.b3mageuk   import check_b3mageuk
 from gateways.b3woo      import check_b3woo
 from gateways.ppcp       import check_ppcp
 from gateways.pymntpl    import check_pymntpl
@@ -108,9 +110,11 @@ WORKING_SITES_FILES = {
     "ppcp":      "data/ppcp.txt",
     "pymntpl":   "data/pymntpl.txt",
     "b3magento": "data/b3magento.txt",
+    "b3magus":   "data/b3magus.txt",
+    "b3mageuk":  "data/b3mageuk.txt",
     "b3woo":     "data/b3woo.txt",
 }
-_WORKING_SITES: dict[str, set] = {"authnet": set(), "ppcp": set(), "pymntpl": set(), "b3magento": set(), "b3woo": set()}
+_WORKING_SITES: dict[str, set] = {"authnet": set(), "ppcp": set(), "pymntpl": set(), "b3magento": set(), "b3magus": set(), "b3mageuk": set(), "b3woo": set()}
 _SITES_LOCK = threading.Lock()
 
 
@@ -294,6 +298,10 @@ def _scan_worker(
                         result = check_pymntpl(sess, domain, card_tuple)
                     elif gateway == "b3magento":
                         result = check_b3magento(sess, domain, card_tuple)
+                    elif gateway == "b3magus":
+                        result = check_b3magus(sess, domain, card_tuple)
+                    elif gateway == "b3mageuk":
+                        result = check_b3mageuk(sess, domain, card_tuple)
                     elif gateway == "b3woo":
                         result = check_b3woo(sess, domain, card_tuple)
                     else:
@@ -466,7 +474,7 @@ def scan():
 
     user_proxy = str(data.get("proxy",   "") or "").strip()
     gateway    = str(data.get("gateway", "authnet") or "authnet").strip().lower()
-    if gateway not in ("authnet", "ppcp", "pymntpl", "b3magento", "b3woo"):
+    if gateway not in ("authnet", "ppcp", "pymntpl", "b3magento", "b3magus", "b3mageuk", "b3woo"):
         gateway = "authnet"
 
     # Parse cards: cc|mm|yy[|cvv]

