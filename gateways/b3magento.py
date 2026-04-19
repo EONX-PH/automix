@@ -541,12 +541,14 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, f
     }
 
     # 1. Discover product (cached per domain to avoid concurrent hammering)
+    # Only cache successful results — never cache None so failed domains are retried.
     with _PRODUCT_CACHE_LOCK:
         cached = _PRODUCT_CACHE.get(domain, "MISS")
     if cached == "MISS":
         product = _discover_product(session, domain, ua)
-        with _PRODUCT_CACHE_LOCK:
-            _PRODUCT_CACHE[domain] = product
+        if product:
+            with _PRODUCT_CACHE_LOCK:
+                _PRODUCT_CACHE[domain] = product
     else:
         product = cached
     if not product:
