@@ -332,7 +332,7 @@ def _scan_worker(
                     _remove_working_site(domain, gateway)
                     good = [d for d in domains if d not in _bad_domains]
                     if good:
-                        domain = good[0]
+                        domain = _next_good_domain()
                         continue  # retry on good domain
                 break  # success / already retried / no good domains left
 

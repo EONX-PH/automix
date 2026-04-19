@@ -24,6 +24,7 @@ import base64
 import json
 import re
 import secrets
+import threading
 
 import requests
 
@@ -38,6 +39,12 @@ from .utils import (
     session_id,
     solve_recaptcha,
 )
+
+# -- Per-domain product cache -------------------------------------------------
+# Avoids hammering the same store's catalog API with N concurrent threads.
+# Keyed by domain, value is (product_id_str, sku_str) or None.
+_PRODUCT_CACHE: dict = {}
+_PRODUCT_CACHE_LOCK = threading.Lock()
 
 
 # -- US State abbreviation -> Magento 2 region_id ----------------------------
@@ -533,8 +540,15 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, f
         "Referer":           base_url + "/checkout/cart/",
     }
 
-    # 1. Discover product
-    product = _discover_product(session, domain, ua)
+    # 1. Discover product (cached per domain to avoid concurrent hammering)
+    with _PRODUCT_CACHE_LOCK:
+        cached = _PRODUCT_CACHE.get(domain, "MISS")
+    if cached == "MISS":
+        product = _discover_product(session, domain, ua)
+        with _PRODUCT_CACHE_LOCK:
+            _PRODUCT_CACHE[domain] = product
+    else:
+        product = cached
     if not product:
         return {"status": "unknown", "message": "Could not find product on store", "amount": "", "card": card_str}
     product_id, product_sku = product
