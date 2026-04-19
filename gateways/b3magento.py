@@ -42,9 +42,11 @@ from .utils import (
 
 # -- Per-domain product cache -------------------------------------------------
 # Avoids hammering the same store's catalog API with N concurrent threads.
-# Keyed by domain, value is (product_id_str, sku_str) or None.
+# Keyed by domain, value is (product_id_str, sku_str).
 _PRODUCT_CACHE: dict = {}
 _PRODUCT_CACHE_LOCK = threading.Lock()
+# Per-domain discovery events — only one thread discovers; others wait.
+_PRODUCT_DISCOVERY_EVENTS: dict = {}  # domain -> threading.Event
 
 
 # -- US State abbreviation -> Magento 2 region_id ----------------------------
@@ -256,32 +258,35 @@ def _create_guest_cart(session: requests.Session, domain: str, ua: str,
 def _discover_product(session: requests.Session, domain: str, ua: str):
     """Return (product_id_str, sku_str) for a purchasable simple product, or None."""
 
-    # Magento 2 REST catalog API (public on most stores)
-    try:
-        r = session.get(
-            f"https://{domain}/rest/V1/products",
-            params={
-                "searchCriteria[pageSize]": "10",
-                "searchCriteria[sortOrders][0][field]": "price",
-                "searchCriteria[sortOrders][0][direction]": "ASC",
-                "searchCriteria[filter_groups][0][filters][0][field]": "type_id",
-                "searchCriteria[filter_groups][0][filters][0][value]": "simple",
-                "searchCriteria[filter_groups][0][filters][0][condition_type]": "eq",
-                "searchCriteria[filter_groups][1][filters][0][field]": "status",
-                "searchCriteria[filter_groups][1][filters][0][value]": "1",
-                "searchCriteria[filter_groups][1][filters][0][condition_type]": "eq",
-                "fields": "items[id,sku,type_id,status]",
-            },
-            headers={"User-Agent": ua, "Accept": "application/json"},
-            timeout=REQUEST_TIMEOUT,
-        )
-        if r.status_code == 200:
-            items = r.json().get("items", [])
-            if items and items[0].get("id"):
-                item = items[0]
-                return str(item["id"]), item.get("sku", "")
-    except Exception:
-        pass
+    # Magento 2 REST catalog API — try multiple store-view prefixes
+    for rest_path in ("/rest/V1", "/rest/default/V1", "/rest/all/V1"):
+        try:
+            r = session.get(
+                f"https://{domain}{rest_path}/products",
+                params={
+                    "searchCriteria[pageSize]": "10",
+                    "searchCriteria[sortOrders][0][field]": "price",
+                    "searchCriteria[sortOrders][0][direction]": "ASC",
+                    "searchCriteria[filter_groups][0][filters][0][field]": "type_id",
+                    "searchCriteria[filter_groups][0][filters][0][value]": "simple",
+                    "searchCriteria[filter_groups][0][filters][0][condition_type]": "eq",
+                    "searchCriteria[filter_groups][1][filters][0][field]": "status",
+                    "searchCriteria[filter_groups][1][filters][0][value]": "1",
+                    "searchCriteria[filter_groups][1][filters][0][condition_type]": "eq",
+                    "fields": "items[id,sku,type_id,status]",
+                },
+                headers={"User-Agent": ua, "Accept": "application/json"},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if r.status_code == 200:
+                items = r.json().get("items", [])
+                if items and items[0].get("id"):
+                    item = items[0]
+                    return str(item["id"]), item.get("sku", "")
+            elif r.status_code == 401:
+                break  # Auth required on all prefixes — skip REST entirely
+        except Exception:
+            pass
 
     # Fallback: HTML scraping for Magento 2 product IDs
     product_ids: list = []
@@ -291,10 +296,14 @@ def _discover_product(session: requests.Session, domain: str, ua: str):
             html = r.text
             ids = re.findall(r'"product"\s*:\s*"?(\d+)"?', html)
             product_ids.extend(ids)
-            ids2 = re.findall(r'data-product[-_]id=["\'](\d+)["\']', html)
+            ids2 = re.findall(r'data-product[-_]id=["\']?(\d+)["\']?', html)
             product_ids.extend(ids2)
             ids3 = re.findall(r'"product_id"\s*:\s*(\d+)', html)
             product_ids.extend(ids3)
+            ids4 = re.findall(r'/checkout/cart/add[^"\'"]*/product/(\d+)', html)
+            product_ids.extend(ids4)
+            ids5 = re.findall(r'["\']entity_id["\']\s*:\s*["\']?(\d+)["\']?', html)
+            product_ids.extend(ids5)
             if product_ids:
                 break
         except Exception:
@@ -540,17 +549,35 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, f
         "Referer":           base_url + "/checkout/cart/",
     }
 
-    # 1. Discover product (cached per domain to avoid concurrent hammering)
-    # Only cache successful results — never cache None so failed domains are retried.
+    # 1. Discover product — only ONE thread per domain does the work; others wait.
+    product = None
+    should_discover = False
+    evt = None
     with _PRODUCT_CACHE_LOCK:
         cached = _PRODUCT_CACHE.get(domain, "MISS")
-    if cached == "MISS":
+        if cached != "MISS":
+            product = cached
+        elif domain in _PRODUCT_DISCOVERY_EVENTS:
+            # Another thread is already discovering — wait for it
+            evt = _PRODUCT_DISCOVERY_EVENTS[domain]
+            should_discover = False
+        else:
+            # This thread wins the discovery race
+            evt = threading.Event()
+            _PRODUCT_DISCOVERY_EVENTS[domain] = evt
+            should_discover = True
+
+    if cached == "MISS" and not should_discover:
+        evt.wait(timeout=60)
+        with _PRODUCT_CACHE_LOCK:
+            product = _PRODUCT_CACHE.get(domain)
+    elif should_discover:
         product = _discover_product(session, domain, ua)
-        if product:
-            with _PRODUCT_CACHE_LOCK:
+        with _PRODUCT_CACHE_LOCK:
+            if product:
                 _PRODUCT_CACHE[domain] = product
-    else:
-        product = cached
+            _PRODUCT_DISCOVERY_EVENTS[domain].set()
+
     if not product:
         return {"status": "unknown", "message": "Could not find product on store", "amount": "", "card": card_str}
     product_id, product_sku = product
