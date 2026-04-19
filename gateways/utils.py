@@ -67,6 +67,71 @@ PROXIES: dict = {
     },
 }
 
+# ── Scrapeless CAPTCHA solver ─────────────────────────────────────────────────
+
+SCRAPELESS_API_KEY: str = os.environ.get("SCRAPELESS_API_KEY", "")
+
+
+def solve_recaptcha(
+    sitekey: str,
+    pageurl: str,
+    version: str = "v2",
+    action: str = "submit",
+    timeout: int = 90,
+) -> str:
+    """Solve reCAPTCHA (v2 or v3) via Scrapeless API.
+
+    Returns the solved token string, or '' on failure / no API key configured.
+    Uses waiting=true for a single synchronous call; falls back to polling if
+    the service returns a taskId without an immediate solution.
+    """
+    if not SCRAPELESS_API_KEY:
+        return ""
+    try:
+        import time
+        s = requests.Session()
+        s.verify = False
+        hdrs = {
+            "x-api-token": SCRAPELESS_API_KEY,
+            "Content-Type": "application/json",
+        }
+        inp: dict = {"version": version, "pageURL": pageurl, "siteKey": sitekey}
+        if version == "v3":
+            inp["pageAction"] = action
+
+        r = s.post(
+            "https://api.scrapeless.com/api/v1/createTask",
+            json={"actor": "captcha.recaptcha", "input": inp, "waiting": True},
+            headers=hdrs,
+            timeout=timeout,
+        )
+        data = r.json()
+
+        # waiting=true → solution returned immediately
+        if data.get("success") and isinstance(data.get("solution"), dict):
+            return data["solution"].get("token", "")
+
+        # Fallback: poll with taskId
+        task_id = data.get("taskId", "")
+        if not task_id:
+            return ""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(4)
+            rr = s.get(
+                f"https://api.scrapeless.com/api/v1/getTaskResult/{task_id}",
+                headers=hdrs,
+                timeout=15,
+            )
+            d = rr.json()
+            if d.get("success") and isinstance(d.get("solution"), dict):
+                return d["solution"].get("token", "")
+            if d.get("state") == "failed":
+                return ""
+    except Exception:
+        pass
+    return ""
+
 
 def get_proxy(name: str = None) -> dict:
     if name and name != "rotate":
@@ -493,38 +558,57 @@ def get_address_for_country(country: str) -> dict:
 def get_billing_identity(domain: str) -> dict:
     """Return a billing identity dict for a given domain.
 
-    Strategy: try eonxgen first (US identity); if it is unavailable,
-    fall back to the country address pool derived from the domain TLD.
-    Name and email are always freshly randomised regardless of source.
+    Strategy:
+      - Non-US domains → always use country pool (avoids US state/region mismatches)
+      - US domains → try eonxgen first, fall back to US pool
+    Name and email are always freshly randomised.
     """
     fname, lname = _generate_random_name()
     email        = _generate_random_email(fname, lname)
+    country      = get_country_for_domain(domain)
 
-    # Try eonxgen
+    # For non-US domains use locale-specific address pool directly
+    if country != "US":
+        addr = get_address_for_country(country)
+        return {
+            "fname":      fname,
+            "lname":      lname,
+            "email":      email,
+            "phone":      addr["phone"],
+            "street":     addr["street"],
+            "city":       addr["city"],
+            "zip":        addr["zip"],
+            "state":      addr["state"],
+            "state_full": addr["state"],
+            "region_id":  "",
+            "country":    country,
+            "password":   f"Pass{random.randint(1000, 9999)}!",
+        }
+
+    # US domain: try eonxgen first
     identity = fetch_identity()
-
     if identity.get("fname") != _FALLBACK_IDENTITY["fname"]:
-        # eonxgen returned real data — override name/email for freshness
         identity["fname"]     = fname
         identity["lname"]     = lname
         identity["full_name"] = f"{fname} {lname}"
         identity["email"]     = email
         return identity
 
-    # Fallback: country pool
-    country = get_country_for_domain(domain)
-    addr    = get_address_for_country(country)
+    # US fallback pool
+    addr = get_address_for_country("US")
     return {
-        "fname":    fname,
-        "lname":    lname,
-        "email":    email,
-        "phone":    addr["phone"],
-        "street":   addr["street"],
-        "city":     addr["city"],
-        "zip":      addr["zip"],
-        "state":    addr["state"],
-        "country":  country,
-        "password": f"Pass{random.randint(1000, 9999)}!",
+        "fname":      fname,
+        "lname":      lname,
+        "email":      email,
+        "phone":      addr["phone"],
+        "street":     addr["street"],
+        "city":       addr["city"],
+        "zip":        addr["zip"],
+        "state":      addr["state"],
+        "state_full": addr["state"],
+        "region_id":  "",
+        "country":    "US",
+        "password":   f"Pass{random.randint(1000, 9999)}!",
     }
 
 

