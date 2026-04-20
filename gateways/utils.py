@@ -556,16 +556,21 @@ def get_address_for_country(country: str) -> dict:
 
 
 def get_billing_identity(domain: str) -> dict:
-    """Return a billing identity dict for a given domain.
+    """Return a billing identity dict for a given domain or country code.
 
     Strategy:
+      - If domain is a bare ISO-2 country code (e.g. 'US', 'GB') use it directly.
       - Non-US domains → always use country pool (avoids US state/region mismatches)
       - US domains → try eonxgen first, fall back to US pool
     Name and email are always freshly randomised.
     """
     fname, lname = _generate_random_name()
     email        = _generate_random_email(fname, lname)
-    country      = get_country_for_domain(domain)
+    # Accept bare country codes (e.g. force_country="GB") in addition to domain names
+    if len(domain) == 2 and domain.upper() in ADDRESS_POOLS:
+        country = domain.upper()
+    else:
+        country = get_country_for_domain(domain)
 
     # For non-US domains use locale-specific address pool directly
     if country != "US":

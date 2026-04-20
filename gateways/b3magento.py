@@ -407,6 +407,8 @@ def _session_atc(session: requests.Session, domain: str, ua: str,
 def _parse_checkout_config(session: requests.Session, domain: str, ua: str) -> dict:
     """Visit /checkout/ and return parsed window.checkoutConfig dict (or {}).
     Also sets result['recaptcha_sitekey'] if a reCAPTCHA sitekey is found.
+    Falls back to broad regex extraction when window.checkoutConfig is absent
+    (e.g. custom one-step-checkout modules that embed config differently).
     """
     try:
         r = session.get(
@@ -417,29 +419,48 @@ def _parse_checkout_config(session: requests.Session, domain: str, ua: str) -> d
         if r.status_code != 200:
             return {}
         html = r.text
-        m = re.search(r'window\.checkoutConfig\s*=\s*(\{)', html)
-        if not m:
-            return {}
-        raw = html[m.start(1):]
-        # Try full JSON decode first (handles trailing JS after the object)
-        decoder = json.JSONDecoder()
         result: dict = {}
-        try:
-            data, _ = decoder.raw_decode(raw)
-            if isinstance(data, dict):
-                result = data
-        except Exception:
-            # Regex fallback: extract the three fields we need
-            ct_m  = re.search(r'"clientToken"\s*:\s*"([A-Za-z0-9+/=]{40,})"', raw[:300000])
-            mid_m = re.search(r'"masked_id"\s*:\s*"([A-Za-z0-9]{32,})"', raw[:300000])
-            eid_m = re.search(r'"entity_id"\s*:\s*"([A-Za-z0-9]{15,})"', raw[:300000])
-            gt_m  = re.search(r'"grand_total"\s*:\s*([0-9]+\.?[0-9]*)', raw[:300000])
+
+        m = re.search(r'window\.checkoutConfig\s*=\s*(\{)', html)
+        if m:
+            raw = html[m.start(1):]
+            # Try full JSON decode first (handles trailing JS after the object)
+            decoder = json.JSONDecoder()
+            try:
+                data, _ = decoder.raw_decode(raw)
+                if isinstance(data, dict):
+                    result = data
+            except Exception:
+                # Regex fallback inside checkoutConfig block
+                ct_m  = re.search(r'"clientToken"\s*:\s*"([A-Za-z0-9+/=]{40,})"', raw[:300000])
+                mid_m = re.search(r'"masked_id"\s*:\s*"([A-Za-z0-9]{32,})"', raw[:300000])
+                eid_m = re.search(r'"entity_id"\s*:\s*"([A-Za-z0-9]{15,})"', raw[:300000])
+                gt_m  = re.search(r'"grand_total"\s*:\s*([0-9]+\.?[0-9]*)', raw[:300000])
+                if ct_m:
+                    result = {"payment": {"braintree": {"clientToken": ct_m.group(1)}}}
+                if mid_m:
+                    result.setdefault("quoteData", {})["masked_id"] = mid_m.group(1)
+                elif eid_m:
+                    result.setdefault("quoteData", {})["entity_id"] = eid_m.group(1)
+                if gt_m:
+                    result.setdefault("quoteData", {})["grand_total"] = float(gt_m.group(1))
+
+        # Broad fallback: custom checkout modules (e.g. OneStepCheckout) don't use
+        # window.checkoutConfig — search all script content directly.
+        if not result.get("payment", {}).get("braintree", {}).get("clientToken"):
+            ct_m = re.search(r'"clientToken"\s*:\s*"([A-Za-z0-9+/=]{40,})"', html)
             if ct_m:
-                result = {"payment": {"braintree": {"clientToken": ct_m.group(1)}}}
+                result.setdefault("payment", {}).setdefault("braintree", {})["clientToken"] = ct_m.group(1)
+        if not (result.get("quoteData") or {}).get("masked_id"):
+            mid_m = re.search(r'"masked_id"\s*:\s*"([A-Za-z0-9]{32,})"', html)
             if mid_m:
                 result.setdefault("quoteData", {})["masked_id"] = mid_m.group(1)
-            elif eid_m:
+        if not (result.get("quoteData") or {}).get("entity_id") and not (result.get("quoteData") or {}).get("masked_id"):
+            eid_m = re.search(r'"entity_id"\s*:\s*"?(\d+)"?', html)
+            if eid_m:
                 result.setdefault("quoteData", {})["entity_id"] = eid_m.group(1)
+        if not (result.get("quoteData") or {}).get("grand_total"):
+            gt_m = re.search(r'"grand_total"\s*:\s*([0-9]+\.?[0-9]*)', html)
             if gt_m:
                 result.setdefault("quoteData", {})["grand_total"] = float(gt_m.group(1))
 
@@ -604,9 +625,12 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, f
             bt_cfg           = (cc_data.get("payment") or {}).get("braintree") or {}
             client_token_raw = bt_cfg.get("clientToken", "")
             qd               = cc_data.get("quoteData") or {}
-            # Prefer masked_id (32-char hex) over entity_id (small integer)
-            masked_id        = qd.get("masked_id") or qd.get("entity_id", "")
-            grand            = qd.get("grand_total")
+            # Only use masked_id when it's a real 32-char hex token.
+            # entity_id is a small integer (session cart) — NOT valid for REST guest-cart APIs.
+            raw_mid = qd.get("masked_id", "")
+            if raw_mid and len(raw_mid) >= 20:
+                masked_id = raw_mid
+            grand = qd.get("grand_total")
             if grand:
                 amount = f"${grand}"
 
