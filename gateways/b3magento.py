@@ -1099,7 +1099,7 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, f
                             "number":          cc,
                             "expirationMonth": mm,
                             "expirationYear":  yy,
-                            "cvv":             "",
+                            "cvv":             cvv,
                         },
                         "options": {"validate": False},
                     }
