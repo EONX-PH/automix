@@ -79,6 +79,7 @@ def send_telegram(message: str) -> None:
         logger.warning("Telegram notification failed", exc_info=True)
 
 
+# ─────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────
 
 app = Flask(__name__)

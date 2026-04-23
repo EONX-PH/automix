@@ -255,8 +255,126 @@ def _create_guest_cart(session: requests.Session, domain: str, ua: str,
 
     return None, None
 
+_PW_EXTRACT_JS = """() => {
+    const items = [];
+    // [data-product-id] covers most Magento 2 themes
+    document.querySelectorAll('[data-product-id]').forEach(el => {
+        const pid = el.getAttribute('data-product-id');
+        const sku = el.getAttribute('data-product-sku') || '';
+        const root = el.closest('.product-item-info, .product-item, .item') || el;
+        const priceEl = root.querySelector('.price');
+        const raw = priceEl ? priceEl.textContent.replace(/[^0-9.]/g, '') : '';
+        const price = parseFloat(raw) || 99999;
+        if (pid) items.push({pid, sku, price});
+    });
+    // ATC forms: input[name="product"] inside form[action*="checkout/cart/add"]
+    document.querySelectorAll('form[action*="checkout/cart/add"] input[name="product"]').forEach(inp => {
+        const pid = inp.value;
+        const form = inp.closest('form');
+        const root = form ? (form.closest('.product-item-info, .product-item, .item') || form) : inp;
+        const skuInp = form ? form.querySelector('[name="sku"]') : null;
+        const sku = skuInp ? skuInp.value : '';
+        const priceEl = root.querySelector('.price');
+        const raw = priceEl ? priceEl.textContent.replace(/[^0-9.]/g, '') : '';
+        const price = parseFloat(raw) || 99999;
+        if (pid) items.push({pid, sku, price});
+    });
+    // Deduplicate by pid, keep entry with lowest price
+    const map = {};
+    items.forEach(i => {
+        if (!map[i.pid] || i.price < map[i.pid].price) map[i.pid] = i;
+    });
+    return Object.values(map).sort((a, b) => a.price - b.price);
+}"""
+
+
+def _discover_product_playwright(domain: str):
+    """Browse the store with a real browser, collect visible products+prices,
+    return (product_id_str, sku_str) for the cheapest one, or None."""
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return None
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            )
+            ctx = browser.new_context(
+                user_agent=random_ua(),
+                ignore_https_errors=True,
+                viewport={"width": 1280, "height": 800},
+            )
+            page = ctx.new_page()
+            page.set_default_timeout(20000)
+
+            urls_to_try = [
+                f"https://{domain}/",
+                f"https://{domain}/catalogsearch/result/?q=a",
+                f"https://{domain}/catalogsearch/result/?q=product",
+                f"https://{domain}/catalogsearch/result/?q=shirt",
+            ]
+
+            best = None
+            for url in urls_to_try:
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                    products = page.evaluate(_PW_EXTRACT_JS)
+                    if products:
+                        # Prefer the cheapest with an actual price over fallback items
+                        for p in products:
+                            if p["price"] < 99999:
+                                best = p
+                                break
+                        if not best:
+                            best = products[0]
+                        break
+                except PWTimeout:
+                    continue
+
+            if not best:
+                browser.close()
+                return None
+
+            pid = str(best["pid"])
+            sku = best.get("sku", "")
+
+            # If SKU is unknown, navigate to the product page to resolve it
+            if not sku:
+                try:
+                    page.goto(
+                        f"https://{domain}/catalog/product/view/id/{pid}/",
+                        wait_until="domcontentloaded",
+                        timeout=15000,
+                    )
+                    sku = page.evaluate("""() => {
+                        return (
+                            document.querySelector('[data-product-sku]')
+                                ?.getAttribute('data-product-sku')
+                            || document.querySelector('.sku .value')?.textContent?.trim()
+                            || document.querySelector('[itemprop="sku"]')?.textContent?.trim()
+                            || ''
+                        );
+                    }""") or ""
+                except PWTimeout:
+                    pass
+
+            browser.close()
+            return pid, sku
+
+    except Exception:
+        return None
+
+
 def _discover_product(session: requests.Session, domain: str, ua: str):
     """Return (product_id_str, sku_str) for a purchasable simple product, or None."""
+
+    # Primary: Playwright renders the page fully, finds cheapest by visible price
+    result = _discover_product_playwright(domain)
+    if result:
+        return result
 
     # Magento 2 REST catalog API — try multiple store-view prefixes
     for rest_path in ("/rest/V1", "/rest/default/V1", "/rest/all/V1"):
