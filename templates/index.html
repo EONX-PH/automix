@@ -234,6 +234,7 @@
     #gwSelect.gw-b3magus    { border-color:rgba(230,100,0,.5);  box-shadow:0 0 6px rgba(230,100,0,.25); }
     #gwSelect.gw-b3mageuk   { border-color:rgba(0,100,200,.5);  box-shadow:0 0 6px rgba(0,100,200,.25); }
     #gwSelect.gw-b3woo     { border-color:rgba(127,84,179,.5); box-shadow:0 0 6px rgba(127,84,179,.25); }
+    #gwSelect.gw-wooauthsim { border-color:rgba(0,200,83,.5);  box-shadow:0 0 6px rgba(0,200,83,.25); }
 
     /* ----- Panel icon buttons (copy + eye) — fixed square, all screens ----- */
     .panel-btn-group { display:flex; align-items:center; gap:.4rem; }
@@ -324,6 +325,7 @@
               <option value="b3magus">B3 MAGUS (US)</option>
               <option value="b3mageuk">B3 MAGEUK (UK)</option>
               <option value="b3woo">B3 WOO</option>
+              <option value="wooauthsim">WOOAUTH SIM</option>
             </select>
           </div>
         </div>
@@ -524,13 +526,19 @@ let _badDomains  = [];
 
 // ─── Gateway selector ───────────────────────────────────────────────────────────
 const _GW_DOMAIN_HINTS = {
-  authnet:   'AuthNet — enter target store URLs',
-  ppcp:      'PayPal / PPCP — enter target store URLs',
-  pymntpl:   'PaymentPlugins — enter target store URLs',
-  b3magento: 'Braintree Magento 2 — enter target store URLs',
-  b3magus:   'Braintree Magento 2 US — enter target store URLs',
-  b3mageuk:  'Braintree Magento 2 UK — enter target store URLs',
-  b3woo:     'Braintree WooCommerce — enter target store URLs',
+  authnet:      'AuthNet — enter target store URLs',
+  ppcp:         'PayPal / PPCP — enter target store URLs',
+  pymntpl:      'PaymentPlugins — enter target store URLs',
+  b3magento:    'Braintree Magento 2 — enter target store URLs',
+  b3magus:      'Braintree Magento 2 US — enter target store URLs',
+  b3mageuk:     'Braintree Magento 2 UK — enter target store URLs',
+  b3woo:        'Braintree WooCommerce — enter target store URLs',
+  wooauthsim:   'WooAuth SIM — one domain per line (or domain|pid1,pid2)',
+};
+
+// Pre-built site lists shown in domain textarea for fixed-site gateways
+const _GW_FIXED_SITES = {
+  wooauthsim: 'aronicadiffuser.com\nartbyjodiarias.com',
 };
 function setGateway(gw) {
   _gateway = gw;
@@ -541,6 +549,16 @@ function setGateway(gw) {
   }
   const lbl = document.querySelector('#domainGroup label');
   if (lbl) lbl.textContent = _GW_DOMAIN_HINTS[gw] || _GW_DOMAIN_HINTS.authnet;
+  // Pre-populate domain textarea for fixed-site gateways only when empty
+  // (allows the user to freely edit and add more sites)
+  if (_GW_FIXED_SITES[gw]) {
+    const ta = document.getElementById('domainInput');
+    if (ta && !ta.value.trim()) {
+      ta.value = _GW_FIXED_SITES[gw];
+      const grp = document.getElementById('domainGroup');
+      if (grp) grp.classList.add('filled');
+    }
+  }
   try { sessionStorage.setItem('chkr_gateway', gw); } catch(e) {}
 }
 
@@ -621,7 +639,7 @@ function loadSession() {
       document.getElementById('threadVal').textContent = t;
     }
     if (p) document.getElementById('proxyInput').value = p;
-    if (gw && ['authnet','ppcp','pymntpl','b3magento','b3magus','b3mageuk','b3woo'].includes(gw)) setGateway(gw);
+    if (gw && ['authnet','ppcp','pymntpl','b3magento','b3magus','b3mageuk','b3woo','wooauthsim'].includes(gw)) setGateway(gw);
     else setGateway('authnet');
     ['cardGroup','domainGroup'].forEach(id => {
       const grp = document.getElementById(id);

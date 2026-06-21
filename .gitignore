@@ -1,9 +1,5 @@
 # Sensitive / generated — never commit
-data/cards/
-data/authnet.txt
-data/ppcp.txt
-/data/b3magento.txt
-/data/b3woo.txt
+data/
 
 # Environment variables (secrets)
 .env
